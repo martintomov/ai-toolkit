@@ -13,7 +13,9 @@ SaveFormat = Literal['safetensors', 'diffusers']
 
 if TYPE_CHECKING:
     from toolkit.guidance import GuidanceType
-
+    from toolkit.logging import EmptyLogger
+else:
+    EmptyLogger = None
 
 class SaveConfig:
     def __init__(self, **kwargs):
@@ -27,11 +29,13 @@ class SaveConfig:
         self.hf_repo_id: Optional[str] = kwargs.get("hf_repo_id", None)
         self.hf_private: Optional[str] = kwargs.get("hf_private", False)
 
-class LogingConfig:
+class LoggingConfig:
     def __init__(self, **kwargs):
         self.log_every: int = kwargs.get('log_every', 100)
         self.verbose: bool = kwargs.get('verbose', False)
         self.use_wandb: bool = kwargs.get('use_wandb', False)
+        self.project_name: str = kwargs.get('project_name', 'ai-toolkit')
+        self.run_name: str = kwargs.get('run_name', None)
 
 
 class SampleConfig:
@@ -202,6 +206,16 @@ class AdapterConfig:
         self.ilora_down: bool = kwargs.get('ilora_down', True)
         self.ilora_mid: bool = kwargs.get('ilora_mid', True)
         self.ilora_up: bool = kwargs.get('ilora_up', True)
+        
+        self.pixtral_max_image_size: int = kwargs.get('pixtral_max_image_size', 512)
+        self.pixtral_random_image_size: int = kwargs.get('pixtral_random_image_size', False)
+
+        self.flux_only_double: bool = kwargs.get('flux_only_double', False)
+        
+        # train and use a conv layer to pool the embedding
+        self.conv_pooling: bool = kwargs.get('conv_pooling', False)
+        self.conv_pooling_stacks: int = kwargs.get('conv_pooling_stacks', 1)
+        self.sparse_autoencoder_dim: Optional[int] = kwargs.get('sparse_autoencoder_dim', None)
 
 
 class EmbeddingConfig:
@@ -236,6 +250,7 @@ class TrainConfig:
         self.min_denoising_steps: int = kwargs.get('min_denoising_steps', 0)
         self.max_denoising_steps: int = kwargs.get('max_denoising_steps', 1000)
         self.batch_size: int = kwargs.get('batch_size', 1)
+        self.orig_batch_size: int = self.batch_size
         self.dtype: str = kwargs.get('dtype', 'fp32')
         self.xformers = kwargs.get('xformers', False)
         self.sdp = kwargs.get('sdp', False)
@@ -284,7 +299,15 @@ class TrainConfig:
 
         # set to -1 to accumulate gradients for entire epoch
         # warning, only do this with a small dataset or you will run out of memory
+        # This is legacy but left in for backwards compatibility
         self.gradient_accumulation_steps = kwargs.get('gradient_accumulation_steps', 1)
+
+        # this will do proper gradient accumulation where you will not see a step until the end of the accumulation
+        # the method above will show a step every accumulation
+        self.gradient_accumulation = kwargs.get('gradient_accumulation', 1)
+        if self.gradient_accumulation > 1:
+            if self.gradient_accumulation_steps != 1:
+                raise ValueError("gradient_accumulation and gradient_accumulation_steps are mutually exclusive")
 
         # short long captions will double your batch size. This only works when a dataset is
         # prepared with a json caption file that has both short and long captions in it. It will
@@ -358,8 +381,14 @@ class TrainConfig:
         # adds an additional loss to the network to encourage it output a normalized standard deviation
         self.target_norm_std = kwargs.get('target_norm_std', None)
         self.target_norm_std_value = kwargs.get('target_norm_std_value', 1.0)
+        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear
         self.linear_timesteps = kwargs.get('linear_timesteps', False)
+        self.linear_timesteps2 = kwargs.get('linear_timesteps2', False)
         self.disable_sampling = kwargs.get('disable_sampling', False)
+
+        # will cache a blank prompt or the trigger word, and unload the text encoder to cpu
+        # will make training faster and use less vram
+        self.unload_text_encoder = kwargs.get('unload_text_encoder', False)
 
 
 class ModelConfig:
@@ -386,6 +415,7 @@ class ModelConfig:
         self.lora_path = kwargs.get('lora_path', None)
         # mainly for decompression loras for distilled models
         self.assistant_lora_path = kwargs.get('assistant_lora_path', None)
+        self.inference_lora_path = kwargs.get('inference_lora_path', None)
         self.latent_space_version = kwargs.get('latent_space_version', None)
 
         # only for SDXL models for now
@@ -416,6 +446,9 @@ class ModelConfig:
         # only for flux for now
         self.quantize = kwargs.get("quantize", False)
         self.low_vram = kwargs.get("low_vram", False)
+        self.attn_masking = kwargs.get("attn_masking", False)
+        if self.attn_masking and not self.is_flux:
+            raise ValueError("attn_masking is only supported with flux models currently")
         pass
 
 
@@ -580,6 +613,8 @@ class DatasetConfig:
 
         # ip adapter / reference dataset
         self.clip_image_path: str = kwargs.get('clip_image_path', None)  # depth maps, etc
+        # get the clip image randomly from the same folder as the image. Useful for folder grouped pairs.
+        self.clip_image_from_same_folder: bool = kwargs.get('clip_image_from_same_folder', False)
         self.clip_image_augmentations: List[dict] = kwargs.get('clip_image_augmentations', None)
         self.clip_image_shuffle_augmentations: bool = kwargs.get('clip_image_shuffle_augmentations', False)
         self.replacements: List[str] = kwargs.get('replacements', [])
@@ -640,6 +675,7 @@ class GenerateImageConfig:
             extra_kwargs: dict = None,  # extra data to save with prompt file
             refiner_start_at: float = 0.5,  # start at this percentage of a step. 0.0 to 1.0 . 1.0 is the end
             extra_values: List[float] = None,  # extra values to save with prompt file
+            logger: Optional[EmptyLogger] = None,
     ):
         self.width: int = width
         self.height: int = height
@@ -696,6 +732,8 @@ class GenerateImageConfig:
         # adjust height
         self.height = max(64, self.height - self.height % 8)  # round to divisible by 8
         self.width = max(64, self.width - self.width % 8)  # round to divisible by 8
+
+        self.logger = logger
 
     def set_gen_time(self, gen_time: int = None):
         if gen_time is not None:
@@ -840,3 +878,9 @@ class GenerateImageConfig:
     ):
         # this is called after prompt embeds are encoded. We can override them in the future here
         pass
+    
+    def log_image(self, image, count: int = 0, max_count=0):
+        if self.logger is None:
+            return
+
+        self.logger.log_image(image, count, self.prompt)

@@ -497,30 +497,46 @@ class StableDiffusion:
                 transformer.to(torch.device(self.quantize_device), dtype=dtype)
             flush()
 
-            if self.model_config.assistant_lora_path is not None:
+            if self.model_config.assistant_lora_path is not None or self.model_config.inference_lora_path is not None:
+                if self.model_config.inference_lora_path is not None and self.model_config.assistant_lora_path is not None:
+                    raise ValueError("Cannot load both assistant lora and inference lora at the same time")
+                
                 if self.model_config.lora_path:
                     raise ValueError("Cannot load both assistant lora and lora at the same time")
 
                 if not self.is_flux:
-                    raise ValueError("Assistant lora is only supported for flux models currently")
+                    raise ValueError("Assistant/ inference lora is only supported for flux models currently")
+                
+                load_lora_path = self.model_config.inference_lora_path
+                if load_lora_path is None:
+                    load_lora_path = self.model_config.assistant_lora_path
 
-                # handle downloading from the hub if needed
-                if not os.path.exists(self.model_config.assistant_lora_path):
-                    print(f"Grabbing assistant lora from the hub: {self.model_config.assistant_lora_path}")
+                if os.path.isdir(load_lora_path):
+                    load_lora_path = os.path.join(
+                        load_lora_path, "pytorch_lora_weights.safetensors"
+                    )
+                elif not os.path.exists(load_lora_path):
+                    print(f"Grabbing lora from the hub: {load_lora_path}")
                     new_lora_path = hf_hub_download(
-                        self.model_config.assistant_lora_path,
+                        load_lora_path,
                         filename="pytorch_lora_weights.safetensors"
                     )
                     # replace the path
-                    self.model_config.assistant_lora_path = new_lora_path
+                    load_lora_path = new_lora_path
+                    
+                    if self.model_config.inference_lora_path is not None:
+                        self.model_config.inference_lora_path = new_lora_path
+                    if self.model_config.assistant_lora_path is not None:
+                        self.model_config.assistant_lora_path = new_lora_path
 
-                # for flux, we assume it is flux schnell. We cannot merge in the assistant lora and unmerge it on
-                # quantized weights so it had to process unmerged (slow). Since schnell samples in just 4 steps
-                # it is better to merge it in now, and sample slowly later, otherwise training is slowed in half
-                # so we will merge in now and sample with -1 weight later
-                self.invert_assistant_lora = True
-                # trigger it to get merged in
-                self.model_config.lora_path = self.model_config.assistant_lora_path
+                if self.model_config.assistant_lora_path is not None:
+                    # for flux, we assume it is flux schnell. We cannot merge in the assistant lora and unmerge it on
+                    # quantized weights so it had to process unmerged (slow). Since schnell samples in just 4 steps
+                    # it is better to merge it in now, and sample slowly later, otherwise training is slowed in half
+                    # so we will merge in now and sample with -1 weight later
+                    self.invert_assistant_lora = True
+                    # trigger it to get merged in
+                    self.model_config.lora_path = self.model_config.assistant_lora_path
 
             if self.model_config.lora_path is not None:
                 print("Fusing in LoRA")
@@ -760,6 +776,13 @@ class StableDiffusion:
                 # invert and disable during training
                 self.assistant_lora.multiplier = -1.0
                 self.assistant_lora.is_active = False
+                
+        if self.model_config.inference_lora_path is not None:
+            print("Loading inference lora")
+            self.assistant_lora: 'LoRASpecialNetwork' = load_assistant_lora_from_path(
+                self.model_config.inference_lora_path, self)
+            # disable during training
+            self.assistant_lora.is_active = False
 
         if self.is_pixart and self.vae_scale_factor == 16:
             # TODO make our own pipeline?
@@ -837,6 +860,12 @@ class StableDiffusion:
                 self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
             else:
                 self.assistant_lora.is_active = False
+                
+        if self.model_config.inference_lora_path is not None:
+            print("Loading inference lora")
+            self.assistant_lora.is_active = True
+            # move weights on to the device
+            self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
 
         if self.network is not None:
             self.network.eval()
@@ -1124,8 +1153,8 @@ class StableDiffusion:
                         conditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(validation_image)
                         unconditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(validation_image,
                                                                                                     True)
-                        conditional_embeds = self.adapter(conditional_embeds, conditional_clip_embeds)
-                        unconditional_embeds = self.adapter(unconditional_embeds, unconditional_clip_embeds)
+                        conditional_embeds = self.adapter(conditional_embeds, conditional_clip_embeds, is_unconditional=False)
+                        unconditional_embeds = self.adapter(unconditional_embeds, unconditional_clip_embeds, is_unconditional=True)
 
                     if self.adapter is not None and isinstance(self.adapter,
                                                                CustomAdapter) and validation_image is not None:
@@ -1318,6 +1347,7 @@ class StableDiffusion:
                         ).images[0]
 
                     gen_config.save_image(img, i)
+                    gen_config.log_image(img, i)
 
                 if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
                     self.adapter.clear_memory()
@@ -1352,6 +1382,12 @@ class StableDiffusion:
                 self.assistant_lora.force_to('cpu', self.torch_dtype)
             else:
                 self.assistant_lora.is_active = True
+                
+        if self.model_config.inference_lora_path is not None:
+            print("Unloading inference lora")
+            self.assistant_lora.is_active = False
+            # move weights off the device
+            self.assistant_lora.force_to('cpu', self.torch_dtype)
 
         flush()
 
@@ -1457,6 +1493,7 @@ class StableDiffusion:
             detach_unconditional=False,
             rescale_cfg=None,
             return_conditional_pred=False,
+            guidance_embedding_scale=1.0,
             **kwargs,
     ):
         conditional_pred = None
@@ -1732,10 +1769,12 @@ class StableDiffusion:
                         txt_ids = torch.zeros(bs, text_embeddings.text_embeds.shape[1], 3).to(self.device_torch)
 
                         # # handle guidance
-                        guidance_scale = 1.0  # ?
                         if self.unet.config.guidance_embeds:
-                            guidance = torch.tensor([guidance_scale], device=self.device_torch)
-                            guidance = guidance.expand(latents.shape[0])
+                            if isinstance(guidance_scale, list):
+                                guidance = torch.tensor(guidance_scale, device=self.device_torch)
+                            else:
+                                guidance = torch.tensor([guidance_scale], device=self.device_torch)
+                                guidance = guidance.expand(latents.shape[0])
                         else:
                             guidance = None
 
@@ -2001,7 +2040,8 @@ class StableDiffusion:
                 prompt,
                 truncate=not long_prompts,
                 max_length=512,
-                dropout_prob=dropout_prob
+                dropout_prob=dropout_prob,
+                attn_mask=self.model_config.attn_masking
             )
             pe = PromptEmbeds(
                 prompt_embeds
@@ -2016,11 +2056,16 @@ class StableDiffusion:
                 self.text_encoder,
                 prompt,
                 truncate=not long_prompts,
-                max_length=77,  # todo set this higher when not transfer learning
+                max_length=256,
                 dropout_prob=dropout_prob
             )
+            
+            # just mask the attention mask
+            prompt_attention_mask = attention_mask.unsqueeze(-1).expand(embeds.shape)
+            embeds = embeds * prompt_attention_mask.to(dtype=embeds.dtype, device=embeds.device)
             return PromptEmbeds(
                 embeds,
+                
                 # do we want attn mask here?
                 # attention_mask=attention_mask,
             )
@@ -2214,11 +2259,11 @@ class StableDiffusion:
                 #         named_params[name] = param
 
                 # train the guidance embedding
-                if self.unet.config.guidance_embeds:
-                    transformer: FluxTransformer2DModel = self.unet
-                    for name, param in transformer.time_text_embed.named_parameters(recurse=True,
-                                                                                    prefix=f"{SD_PREFIX_UNET}"):
-                        named_params[name] = param
+                # if self.unet.config.guidance_embeds:
+                #     transformer: FluxTransformer2DModel = self.unet
+                #     for name, param in transformer.time_text_embed.named_parameters(recurse=True,
+                #                                                                     prefix=f"{SD_PREFIX_UNET}"):
+                #         named_params[name] = param
 
                 for name, param in self.unet.transformer_blocks.named_parameters(recurse=True,
                                                                                  prefix=f"{SD_PREFIX_UNET}"):
@@ -2633,3 +2678,10 @@ class StableDiffusion:
             }
 
         self.set_device_state(state)
+
+    def text_encoder_to(self, *args, **kwargs):
+        if isinstance(self.text_encoder, list):
+            for encoder in self.text_encoder:
+                encoder.to(*args, **kwargs)
+        else:
+            self.text_encoder.to(*args, **kwargs)

@@ -117,6 +117,20 @@ Please do not open a bug report unless it is a bug in the code. You are welcome 
 and ask for help there. However, please refrain from PMing me directly with general question or support. Ask in the discord
 and I will answer when I can.
 
+## Gradio UI
+
+To get started training locally with a with a custom UI, once you followed the steps above and `ai-toolkit` is installed:
+
+```bash
+cd ai-toolkit #in case you are not yet in the ai-toolkit folder
+huggingface-cli login #provide a `write` token to publish your LoRA at the end
+python flux_train_ui.py
+```
+
+You will instantiate a UI that will let you upload your images, caption them, train and publish your LoRA
+![image](assets/lora_ease_ui.png)
+
+
 ## Training in RunPod
 Example RunPod template: **runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04**
 > You need a minimum of 24GB VRAM, pick a GPU by your preference.
@@ -221,6 +235,54 @@ replaced.
 
 Images are never upscaled but they are downscaled and placed in buckets for batching. **You do not need to crop/resize your images**.
 The loader will automatically resize them and can handle varying aspect ratios. 
+
+
+## Training Specific Layers
+
+To train specific layers with LoRA, you can use the `only_if_contains` network kwargs. For instance, if you want to train only the 2 layers
+used by The Last Ben, [mentioned in this post](https://x.com/__TheBen/status/1829554120270987740), you can adjust your
+network kwargs like so:
+
+```yaml
+      network:
+        type: "lora"
+        linear: 128
+        linear_alpha: 128
+        network_kwargs:
+          only_if_contains:
+            - "transformer.single_transformer_blocks.7.proj_out"
+            - "transformer.single_transformer_blocks.20.proj_out"
+```
+
+The naming conventions of the layers are in diffusers format, so checking the state dict of a model will reveal 
+the suffix of the name of the layers you want to train. You can also use this method to only train specific groups of weights.
+For instance to only train the `single_transformer` for FLUX.1, you can use the following:
+
+```yaml
+      network:
+        type: "lora"
+        linear: 128
+        linear_alpha: 128
+        network_kwargs:
+          only_if_contains:
+            - "transformer.single_transformer_blocks."
+```
+
+You can also exclude layers by their names by using `ignore_if_contains` network kwarg. So to exclude all the single transformer blocks,
+
+
+```yaml
+      network:
+        type: "lora"
+        linear: 128
+        linear_alpha: 128
+        network_kwargs:
+          ignore_if_contains:
+            - "transformer.single_transformer_blocks."
+```
+
+`ignore_if_contains` takes priority over `only_if_contains`. So if a weight is covered by both,
+if will be ignored.
 
 ---
 
